@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Метро: Линия 1</title>
+<style>
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#0b1320;color:#e6edf5;-webkit-text-size-adjust:100%}
+main{max-width:720px;margin:0 auto;padding:14px}
+h1{font-size:20px;margin:2px 0 4px}
+.sub{font-size:13px;color:#8fa3ba;margin:0 0 10px}
+canvas{display:block;width:100%;height:auto;border-radius:12px;background:#111c2a}
+.hud{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:10px 0}
+.hud div{background:#16243a;border-radius:10px;padding:8px 10px}
+.hud small{display:block;font-size:12px;color:#8fa3ba}
+.hud b{font-size:18px;font-variant-numeric:tabular-nums}
+.msg{min-height:44px;font-size:15px;color:#ffd36b;margin:4px 0 10px}
+.ctrl{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+button{font:inherit;font-size:16px;border:0;border-radius:12px;padding:16px 10px;background:#22364f;color:#e6edf5;cursor:pointer;touch-action:manipulation;-webkit-user-select:none;user-select:none}
+button:disabled{opacity:.4;cursor:default}
+button:focus-visible{outline:3px solid #6fb8ff;outline-offset:2px}
+.hold{touch-action:none}
+.acc{background:#1f6f43}
+.brk{background:#2b4f7a}
+.dep{background:#7a5a1f;grid-column:span 2}
+.em{background:#7d2430;grid-column:span 2;font-size:14px;padding:12px}
+.start{background:#1f6f43;grid-column:span 2}
+.card{background:#16243a;border-radius:12px;padding:12px;margin-top:12px}
+.card h2{font-size:16px;margin:0 0 8px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{padding:7px 4px;text-align:left;border-bottom:1px solid #22364f}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+tr.me td{color:#9fe0b8}
+.log{font-size:13px;color:#8fa3ba;margin:6px 0 0;padding-left:18px}
+.log li{margin:3px 0}
+.note{font-size:13px;color:#8fa3ba;margin:8px 0 0}
+.retry{margin-top:8px;width:100%;background:#7a5a1f}
+</style>
+</head>
+<body>
+<main>
+<h1>Метро: Линия 1</h1>
+<p class="sub">Ведите поезд по маршруту: плавный ход, точная остановка у платформы, стоянка 30 секунд.</p>
+<canvas id="map" width="720" height="200" aria-label="Схема линии и положение поезда"></canvas>
+<div class="hud">
+  <div><small>Скорость</small><b id="spd">0</b> км/ч</div>
+  <div><small id="distlabel">До станции</small><b id="dist">—</b></div>
+  <div><small>Очки</small><b id="score">0</b></div>
+</div>
+<div class="msg" id="msg" role="status" aria-live="polite">Поезд стоит на станции Центральный. Нажмите «Начать рейс».</div>
+<div class="ctrl">
+  <button class="acc hold" id="acc" disabled>Газ (удерживать)</button>
+  <button class="brk hold" id="brk" disabled>Тормоз (удерживать)</button>
+  <button class="dep" id="dep" disabled>Отправление</button>
+  <button class="em" id="em" disabled>Экстренное торможение</button>
+  <button class="start" id="start" disabled>Начать рейс</button>
+</div>
+<button class="retry" id="retry" hidden>Сохранить результат</button>
+<p class="note">Клавиатура: → или ↑ — газ, ← или ↓ — тормоз, пробел — отправление, E — экстренное.</p>
+
+<section class="card">
+  <h2>Общая таблица</h2>
+  <table>
+    <thead><tr><th>Пассажир</th><th class="n">Рейсов</th><th class="n">Лучший</th></tr></thead>
+    <tbody id="board"></tbody>
+  </table>
+  <p class="note" id="syncnote">Подключение к таблице...</p>
+</section>
+
+<section class="card">
+  <h2>Журнал рейса</h2>
+  <ul class="log" id="log"></ul>
+</section>
+</main>
+<script>
+(() => {
+const W = 720, H = 200, PAD = 30, TRACK_END = 5000, RAIL_Y = 128;
+const STATIONS = [
+  { name: "Центральный", x: 0 },
+  { name: "Речной вокзал", x: 820 },
+  { name: "Университет", x: 1900 },
+  { name: "Площадь Победы", x: 2800 },
+  { name: "Заводская", x: 3900 },
+  { name: "Терминал", x: 4900 }
+];
+const MAXV = 20, ACC = 1.0, SERV = 1.2, EMER = 3.0, FRIC = 0.08;
+const LIMIT = 12, ZONE = 150, WIN = 4;
+const DWELL_MIN = 25, DWELL_IDEAL = 30, DWELL_MAX = 35, DWELL_AUTO = 45;
+
+const $ = (id) => document.getElementById(id);
+const canvas = $("map"), ctx = canvas.getContext("2d");
+const sx = (x) => PAD + (x / TRACK_END) * (W - 2 * PAD);
+const keys = { acc: false, brk: false };
+let run = null, mode = "idle", connected = false, session = null;
+let pending = null, saving = false, audio = null;
+
+function setSync(text) { $("syncnote").textContent = text; }
+
+function addLog(text) {
+  const li = document.createElement("li");
+  li.textContent = text;
+  const list = $("log");
+  list.prepend(li);
+  while (list.children.length > 8) list.lastChild.remove();
+}
+
+function say(text) { $("msg").textContent = text; }
+
+function chime(freqs) {
+  try {
+    audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+    const t0 = audio.currentTime;
+    freqs.forEach((f, i) => {
+      const t = t0 + i * 0.25;
+      const o = audio.createOscillator(), g = audio.createGain();
+      o.frequency.value = f;
+      o.connect(g);
+      g.connect(audio.destination);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.15, t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.4);
+      o.start(t);
+      o.stop(t + 0.45);
+    });
+  } catch (e) {
+    return;
+  }
+}
+
+function newRun() {
+  run = { x: 0, v: 0, cur: 0, next: 1, phase: "dwell", dwell: 0, score: 100, emer: 0, over: false };
+  mode = "running";
+  pending = null;
+  $("log").replaceChildren();
+  addLog(`${STATIONS[0].name}: отправная остановка, +100`);
+  say(`${STATIONS[0].name}. Двери открыты. Отправляйтесь по графику.`);
+  updateUI();
+}
+
+function arrive(idx, off) {
+  const s = STATIONS[idx];
+  const pts = Math.max(0, Math.round(100 - 25 * off));
+  run.v = 0;
+  run.phase = "dwell";
+  run.dwell = 0;
+  run.cur = idx;
+  run.next = idx + 1;
+  run.over = false;
+  run.score += pts;
+  addLog(`${s.name}: остановка, отклонение ${off.toFixed(1)} м, +${pts}`);
+  chime([880, 660]);
+  if (idx === STATIONS.length - 1) say(`Конечная станция ${s.name}. Завершите рейс.`);
+  else say(`${s.name}. Двери открыты. Стоянка 30 секунд.`);
+}
+
+function skip() {
+  const s = STATIONS[run.next];
+  run.score -= 40;
+  run.over = false;
+  run.next += 1;
+  addLog(`${s.name}: остановка пропущена, -40`);
+  chime([220, 180]);
+  if (run.next >= STATIONS.length) { finish(); return; }
+  say(`${s.name}: остановка пропущена. Штраф 40 очков. Следующая: ${STATIONS[run.next].name}.`);
+}
+
+function depart(auto) {
+  if (mode !== "running" || run.phase !== "dwell") return;
+  if (run.cur === STATIONS.length - 1) { finish(); return; }
+  const d = run.dwell;
+  let pts, note;
+  if (auto) { pts = -30; note = "двери закрыты автоматически"; }
+  else if (d < DWELL_MIN) { pts = -20; note = `отправление раньше графика, ${d.toFixed(0)} с`; }
+  else if (d <= DWELL_MAX) { pts = Math.round(50 - 5 * Math.abs(d - DWELL_IDEAL)); note = `стоянка ${d.toFixed(0)} с`; }
+  else { pts = -10; note = `опоздание, стоянка ${d.toFixed(0)} с`; }
+  run.score += pts;
+  addLog(`${STATIONS[run.cur].name}: ${note}, ${pts >= 0 ? "+" : ""}${pts}`);
+  run.phase = "run";
+  run.dwell = 0;
+  run.over = false;
+  chime([520, 740]);
+  say(`Двери закрыты. Отправление. Следующая станция: ${STATIONS[run.next].name}.`);
+  updateUI();
+}
+
+function emergency() {
+  if (mode !== "running" || run.phase !== "run") return;
+  run.emer = 4;
+  run.score -= 30;
+  addLog("Экстренное торможение: -30");
+  say("Экстренное торможение. Нарушение регламента, -30 очков.");
+  updateUI();
+}
+
+function finish() {
+  mode = "finished";
+  run.phase = "end";
+  run.v = 0;
+  const total = Math.max(0, Math.round(run.score));
+  pending = total;
+  addLog(`Итог рейса: ${total}`);
+  say(`Рейс завершён. Итог: ${total} очков.`);
+  keys.acc = false;
+  keys.brk = false;
+  saveScore(total);
+  updateUI();
+}
+
+async function saveScore(total) {
+  if (!session || !connected) {
+    setSync("Нет связи с общей таблицей. Нажмите «Сохранить результат» после подключения.");
+    updateUI();
+    return;
+  }
+  if (saving) return;
+  saving = true;
+  setSync("Сохраняю результат...");
+  updateUI();
+  try {
+    await session.maxSelf("best", total);
+    await session.incrementSelf("runs", 1);
+    pending = null;
+    setSync("Результат сохранён в общей таблице.");
+  } catch (e) {
+    setSync("Не удалось сохранить: " + ((e && e.message) || "ошибка") + ". Попробуйте ещё раз.");
+  }
+  saving = false;
+  updateUI();
+}
+
+function step(dt) {
+  if (mode !== "running") return;
+  if (run.phase === "dwell") {
+    run.dwell += dt;
+    if (run.dwell >= DWELL_AUTO) depart(true);
+    updateUI();
+    return;
+  }
+  let a;
+  if (run.emer > 0) { run.emer -= dt; a = -EMER; }
+  else if (keys.brk) a = -SERV;
+  else if (keys.acc) a = ACC;
+  else a = -FRIC;
+  run.v = Math.min(MAXV, Math.max(0, run.v + a * dt));
+  run.x += run.v * dt;
+
+  const ns = STATIONS[run.next];
+  const d = ns.x - run.x;
+  if (d > 0 && d <= ZONE && run.v > LIMIT) {
+    if (!run.over) say("Превышение скорости в зоне торможения. Лимит 12 м/с.");
+    run.over = true;
+    run.score -= 6 * dt;
+  } else {
+    run.over = false;
+  }
+
+  if (run.v < 0.3 && Math.abs(d) <= WIN) arrive(run.next, Math.abs(d));
+  else if (d < -WIN) { skip(); return; }
+  updateUI();
+}
+
+function renderBoard(snap) {
+  const me = session && session.actor ? session.actor.id : null;
+  const actors = (snap && snap.actors) || {};
+  const rows = Object.entries(actors)
+    .map(([id, a]) => ({ id, name: a.name || "Пассажир", best: a.best || 0, runs: a.runs || 0 }))
+    .filter((r) => r.runs > 0 || r.best > 0)
+    .sort((p, q) => q.best - p.best || p.name.localeCompare(q.name));
+  const body = $("board");
+  body.replaceChildren();
+  if (!rows.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 3;
+    td.textContent = "Пока нет результатов";
+    tr.append(td);
+    body.append(tr);
+    return;
+  }
+  rows.forEach((r) => {
+    const tr = document.createElement("tr");
+    if (r.id === me) tr.className = "me";
+    const name = document.createElement("td");
+    name.textContent = r.name;
+    const runs = document.createElement("td");
+    runs.className = "n";
+    runs.textContent = r.runs;
+    const best = document.createElement("td");
+    best.className = "n";
+    best.textContent = r.best;
+    tr.append(name, runs, best);
+    body.append(tr);
+  });
+}
+
+function updateUI() {
+  const running = mode === "running";
+  const dwelling = running && run.phase === "dwell";
+  const moving = running && run.phase === "run";
+  if (!running) { keys.acc = false; keys.brk = false; }
+
+  $("spd").textContent = run ? Math.round(run.v * 3.6) : 0;
+  $("score").textContent = run ? Math.round(run.score) : 0;
+  if (dwelling) {
+    $("distlabel").textContent = "Стоянка";
+    $("dist").textContent = Math.floor(run.dwell) + " с";
+  } else if (moving) {
+    $("distlabel").textContent = "До станции";
+    const ns = STATIONS[run.next];
+    $("dist").textContent = ns ? Math.max(0, Math.round(ns.x - run.x)) + " м" : "—";
+  } else {
+    $("distlabel").textContent = "До станции";
+    $("dist").textContent = "—";
+  }
+
+  $("dep").disabled = !dwelling;
+  $("dep").textContent = dwelling && run.cur === STATIONS.length - 1 ? "Завершить рейс" : "Отправление";
+  $("em").disabled = !moving;
+  $("acc").disabled = !moving;
+  $("brk").disabled = !moving;
+  $("start").disabled = !connected || running || pending !== null || saving;
+  $("start").textContent = mode === "finished" ? "Новый рейс" : "Начать рейс";
+  $("retry").hidden = pending === null;
+  $("retry").disabled = saving;
+  draw();
+}
+
+function draw() {
+  ctx.fillStyle = "#111c2a";
+  ctx.fillRect(0, 0, W, H);
+
+  const next = mode === "running" && run.phase === "run" ? STATIONS[run.next] : null;
+  if (next) {
+    ctx.fillStyle = "rgba(255,211,107,0.14)";
+    ctx.fillRect(sx(next.x - ZONE), 40, sx(next.x) - sx(next.x - ZONE), 110);
+  }
+
+  ctx.strokeStyle = "#3b5573";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(PAD, RAIL_Y - 6); ctx.lineTo(W - PAD, RAIL_Y - 6);
+  ctx.moveTo(PAD, RAIL_Y + 6); ctx.lineTo(W - PAD, RAIL_Y + 6);
+  ctx.stroke();
+  ctx.strokeStyle = "#22364f";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  for (let x = PAD; x <= W - PAD; x += 14) { ctx.moveTo(x, RAIL_Y - 9); ctx.lineTo(x, RAIL_Y + 9); }
+  ctx.stroke();
+
+  ctx.font = "12px system-ui, sans-serif";
+  STATIONS.forEach((s, i) => {
+    const x = sx(s.x);
+    let color = "#e6edf5";
+    if (run && i === run.cur && run.phase === "dwell") color = "#5fd38b";
+    else if (run && i < run.next) color = "#4a6076";
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, RAIL_Y, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.textAlign = i === 0 ? "left" : i === STATIONS.length - 1 ? "right" : "center";
+    const tx = i === 0 ? x - 6 : i === STATIONS.length - 1 ? x + 6 : x;
+    ctx.fillText(s.name, tx, i % 2 ? 172 : 152);
+  });
+  ctx.textAlign = "left";
+
+  const fx = sx(run ? run.x : 0);
+  const bw = 84, by = RAIL_Y - 30, bh = 22, bx = fx - bw;
+  ctx.fillStyle = "#cfd9e6";
+  ctx.fillRect(bx, by, bw, bh);
+  ctx.fillStyle = "#2f6fb0";
+  ctx.fillRect(bx, by + 14, bw, 4);
+  ctx.fillStyle = "#0b1320";
+  ctx.fillRect(bx + 4, by + 2, bw - 8, 9);
+  const tgt = !run ? STATIONS[1] : run.next < STATIONS.length ? STATIONS[run.next] : STATIONS[STATIONS.length - 1];
+  ctx.fillStyle = "#ffb020";
+  ctx.font = "8px system-ui, sans-serif";
+  ctx.fillText(tgt.name, bx + 7, by + 10);
+  ctx.fillStyle = "#0b1320";
+  ctx.beginPath(); ctx.arc(bx + 16, by + bh, 4, 0, Math.PI * 2); ctx.arc(fx - 16, by + bh, 4, 0, Math.PI * 2); ctx.fill();
+}
+
+function hold(btn, key) {
+  const on = (e) => { if (!btn.disabled) { keys[key] = true; e.preventDefault(); } };
+  const off = () => { keys[key] = false; };
+  btn.addEventListener("pointerdown", on);
+  btn.addEventListener("pointerup", off);
+  btn.addEventListener("pointercancel", off);
+  btn.addEventListener("pointerleave", off);
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.code === "Space") { e.preventDefault(); if (!e.repeat) depart(false); return; }
+  if (e.code === "KeyE") { emergency(); return; }
+  if (mode !== "running") return;
+  if (e.code === "ArrowRight" || e.code === "ArrowUp") { keys.acc = true; e.preventDefault(); }
+  if (e.code === "ArrowLeft" || e.code === "ArrowDown") { keys.brk = true; e.preventDefault(); }
+});
+document.addEventListener("keyup", (e) => {
+  if (e.code === "ArrowRight" || e.code === "ArrowUp") keys.acc = false;
+  if (e.code === "ArrowLeft" || e.code === "ArrowDown") keys.brk = false;
+});
+
+hold($("acc"), "acc");
+hold($("brk"), "brk");
+$("dep").addEventListener("click", () => depart(false));
+$("em").addEventListener("click", emergency);
+$("start").addEventListener("click", () => { if (!$("start").disabled) newRun(); });
+$("retry").addEventListener("click", () => { if (pending !== null) saveScore(pending); });
+
+async function connectShared() {
+  if (!window.shapes || !window.shapes.shared) {
+    setSync("Откройте это в shapes.inc, чтобы играть вместе.");
+    return;
+  }
+  try {
+    session = await window.shapes.shared.connect({ initialState: {} });
+    session.subscribe(renderBoard);
+    session.subscribeStatus(({ status }) => {
+      connected = status === "connected";
+      if (connected) setSync("Подключено. Результаты видны всем в этой комнате.");
+      updateUI();
+    });
+    await session.setSelf("name", (session.actor && session.actor.name) || "Пассажир");
+  } catch (e) {
+    setSync("Не удалось подключиться к таблице: " + ((e && e.message) || "ошибка"));
+  }
+}
+
+let last = 0;
+function frame(t) {
+  const dt = last ? Math.min(0.05, (t - last) / 1000) : 0;
+  last = t;
+  step(dt);
+  requestAnimationFrame(frame);
+}
+
+updateUI();
+connectShared();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
